@@ -2,9 +2,6 @@
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
 
-const char* ssid     = "ALTO-HARD-LEO";
-const char* password = "244466666";
-
 IPAddress broadcastIP(255, 255, 255, 255);
 
 const int udpLocalPort  = 8888;   // donde escucha el módulo
