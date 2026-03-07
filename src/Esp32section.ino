@@ -1,14 +1,11 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WiFiManager.h>
 
 const char* ssid     = "ALTO-HARD-LEO";
 const char* password = "244466666";
 
-// Ajusta según tu red real (puedes verlo en Serial después de conectar)
-IPAddress local_IP(192, 168, 88, 120);    // ← cámbialo a tu IP fija deseada
-IPAddress gateway(192, 168, 88, 1);
-IPAddress subnet(255, 255, 255, 0);
-IPAddress broadcastIP(192, 168, 88, 255);
+IPAddress broadcastIP(255, 255, 255, 255);
 
 const int udpLocalPort  = 8888;   // donde escucha el módulo
 const int udpRemotePort = 9999;   // donde AOG escucha (y envía broadcast)
@@ -164,15 +161,21 @@ void setup() {
 
   pinMode(PIN_AUTO,   INPUT_PULLDOWN);
   pinMode(PIN_MASTER, INPUT_PULLDOWN);
+  //Configuracion de AGO
+  WiFiManager wm; 
+  bool res;
+   res = wm.autoConnect("SectionAGO");
 
-  // Conexión WiFi
-  WiFi.config(local_IP, gateway, subnet);
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando WiFi ");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+    if(!res) {
+        Serial.println("Failed to connect");
+        ESP.restart();
+    } 
+    else {
+        //if you get here you have connected to the WiFi    
+        Serial.println("connected...yeey :)");
+    }
+ 
+
   Serial.println("\nConectado! IP: " + WiFi.localIP().toString());
   
   broadcastIP = WiFi.localIP();
