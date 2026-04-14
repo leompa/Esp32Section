@@ -1,7 +1,6 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
-#include "zNMEAParser.h"
 
 #define PIN_RESET_WIFI 0
 unsigned long resetPressTime = 0;
@@ -16,12 +15,6 @@ const int32_t baudGPS = 460800;
 
 IPAddress aogIP;
 bool aogIPKnown = false;
-
-// Prototipos del módulo GPS
-void gpsInit();
-void gpsUpdate();
-bool gpsAvailable();
-char *gpsBuildNmea();
 
 WiFiUDP udp;
 
@@ -362,19 +355,6 @@ void loop()
   {
     sendHello();
     lastHello = millis();
-  }
-
-  if (gpsAvailable())
-  {
-    char *data = gpsBuildNmea();
-
-    Serial.print(data);
-    IPAddress targetIP = aogIPKnown ? aogIP : broadcastIP;
-    udp.beginPacket(targetIP, udpRemotePort);
-    udp.print(data);
-    udp.endPacket();
-
-    // Acá podés enviar por UDP, CAN, etc.
   }
 
   // Enviar estado a AOG cada ~200 ms (como el código original)
