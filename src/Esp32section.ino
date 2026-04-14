@@ -1,183 +1,293 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <WiFiManager.h>
+#include "zNMEAParser.h"
+
+#define PIN_RESET_WIFI 0
+unsigned long resetPressTime = 0;
+bool resetTriggered = false;
 
 IPAddress broadcastIP(255, 255, 255, 255);
 
-const int udpLocalPort  = 8888;   // donde escucha el módulo
-const int udpRemotePort = 9999;   // donde AOG escucha (y envía broadcast)
+const int udpLocalPort = 8888;  // donde escucha el módulo
+const int udpRemotePort = 9999; // donde AOG escucha (y envía broadcast)
+const int aoGpsPort = 1234;
+const int32_t baudGPS = 460800;
+
+IPAddress aogIP;
+bool aogIPKnown = false;
+
+// Prototipos del módulo GPS
+void gpsInit();
+void gpsUpdate();
+bool gpsAvailable();
+char *gpsBuildNmea();
 
 WiFiUDP udp;
 
 #define NUM_RELAYS 3
-const uint8_t relayPins[NUM_RELAYS] = {25, 26, 27};   // ← cambia según tus pines
-uint8_t  relayLastState = 10;
-#define PIN_AUTO    16
-#define PIN_MASTER  17
+const uint8_t relayPins[NUM_RELAYS] = {25, 26, 27}; // ← cambia según tus pines
+uint8_t relayLastState = 11;
 
-bool autoMode       = true;     // true = AUTO, false = MANUAL
-bool masterSections = true;     // Master switch global
-bool lastAutoState   = HIGH;
+#define NUM_SWITCHES 4
+const uint8_t switchPins[NUM_SWITCHES] = {18, 19, 21}; // elegí pines libres
+uint8_t manualSections = 0;
+
+#define PIN_AUTO 16
+#define PIN_MASTER 17
+
+bool autoMode = true;       // true = AUTO, false = MANUAL
+bool masterSections = true; // Master switch global
+bool lastAutoState = HIGH;
 bool lastMasterState = HIGH;
 
-uint8_t sectionLo = 0;   // secciones 0..7
-uint8_t sectionHi = 0;   // secciones 8..15 (no usas por ahora)
+uint8_t sectionLo = 0; // secciones 0..7
+uint8_t sectionHi = 0; // secciones 8..15 (no usas por ahora)
 
-uint8_t onLo = 0, offLo = 0xFF;   // para informar switches estado a AOG
+uint8_t onLo = 0, offLo = 0xFF; // para informar switches estado a AOG
 uint8_t onHi = 0, offHi = 0xFF;
 
-uint32_t lastSend     = 0;
-uint32_t lastHello    = 0;
-uint8_t  watchdog     = 20;      // si > ~10-15 → desconectado
+uint32_t lastSend = 0;
+uint32_t lastHello = 0;
+uint8_t watchdog = 20; // si > ~10-15 → desconectado
 
 byte buffer[32];
 
 // ────────────────────────────────────────────────
-void checkButtons() {
-  bool autoState   = digitalRead(PIN_AUTO);
+void checkButtons()
+{
+  bool autoState = digitalRead(PIN_AUTO);
   bool masterState = digitalRead(PIN_MASTER);
 
-  if (autoState == LOW && lastAutoState == HIGH) {   // flanco descendente
+  if (autoState == LOW && lastAutoState == HIGH)
+  { // flanco descendente
     autoMode = !autoMode;
     Serial.println(autoMode ? "→ MODO AUTO" : "→ MODO MANUAL");
     delay(50); // anti rebote básico
   }
 
-  if (masterState == LOW && lastMasterState == HIGH) {
+  if (masterState == LOW && lastMasterState == HIGH)
+  {
     masterSections = !masterSections;
     Serial.println(masterSections ? "MASTER ON" : "MASTER OFF");
     delay(50);
   }
 
-  lastAutoState   = autoState;
+  lastAutoState = autoState;
   lastMasterState = masterState;
 }
 
-void updateRelays() {
+void updateRelays()
+{
   uint8_t effectiveLo = sectionLo;
 
-  if (!masterSections) {
+  if (!masterSections)
+  {
     effectiveLo = 0;
   }
+  else if (!autoMode)
+  {
+    // MANUAL → usar switches físicos
+    effectiveLo = manualSections;
+  }
+  else
+  {
+    // AUTO → usar AOG
+    effectiveLo = sectionLo;
+  }
   // Solo usamos las primeras 3 secciones por ahora
-  for (int i = 0; i < NUM_RELAYS; i++) {
+  for (int i = 0; i < NUM_RELAYS; i++)
+  {
     bool shouldOn = bitRead(effectiveLo, i);
-    
+
     digitalWrite(relayPins[i], shouldOn ? HIGH : LOW);
   }
-    if (relayLastState != sectionLo) {
-      Serial.print("Relay "); 
-      Serial.println(sectionLo, BIN);
-      relayLastState = sectionLo;
-    }
-
+  if (relayLastState != sectionLo)
+  {
+    Serial.print("Relay ");
+    Serial.println(sectionLo, BIN);
+    relayLastState = sectionLo;
+  }
 }
 
-void sendHello() {
-  byte hello[] = {0x80, 0x81, 0x7B, 0x7B, 5, 0,0,0,0,0, 71};
+void sendHello()
+{
+  byte hello[] = {0x80, 0x81, 0x7B, 0x7B, 5, 0, 0, 0, 0, 0, 71};
   byte ck = 0;
-  for (int i = 2; i < sizeof(hello)-1; i++) ck += hello[i];
-  hello[sizeof(hello)-1] = ck;
+  for (int i = 2; i < sizeof(hello) - 1; i++)
+    ck += hello[i];
+  hello[sizeof(hello) - 1] = ck;
 
-  udp.beginPacket(broadcastIP, udpRemotePort);
+  IPAddress targetIP = aogIPKnown ? aogIP : broadcastIP;
+  udp.beginPacket(targetIP, udpRemotePort);
   udp.write(hello, sizeof(hello));
   udp.endPacket();
 }
 
-void sendScanReply() {
-  byte reply[] = {0x80,0x81,0x7B,203,7, 0,0,0,0, 0,0,0,0, 0};
+void sendScanReply()
+{
+  byte reply[] = {0x80, 0x81, 0x7B, 203, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   reply[5] = WiFi.localIP()[0];
   reply[6] = WiFi.localIP()[1];
   reply[7] = WiFi.localIP()[2];
   reply[8] = WiFi.localIP()[3];
   reply[9] = WiFi.localIP()[0];
-  reply[10]= WiFi.localIP()[1];
-  reply[11]= WiFi.localIP()[2];
-  reply[12]= 23;   // puerto ejemplo
+  reply[10] = WiFi.localIP()[1];
+  reply[11] = WiFi.localIP()[2];
+  reply[12] = 23; // puerto ejemplo
 
   byte ck = 0;
-  for (int i = 2; i < sizeof(reply)-1; i++) ck += reply[i];
-  reply[sizeof(reply)-1] = ck;
+  for (int i = 2; i < sizeof(reply) - 1; i++)
+    ck += reply[i];
+  reply[sizeof(reply) - 1] = ck;
 
-  udp.beginPacket(broadcastIP, udpRemotePort);
+  IPAddress targetIP = aogIPKnown ? aogIP : broadcastIP;
+  udp.beginPacket(targetIP, udpRemotePort);
   udp.write(reply, sizeof(reply));
   udp.endPacket();
 }
 
-void sendToAOG() {
+void sendToAOG()
+{
   byte msg[14] = {0x80, 0x81, 0x7B, 0xEA, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
   // mainByte: 1 = AUTO, 2 = MANUAL
   msg[5] = autoMode ? 1 : 2;
 
   // onLo / offLo: reportamos el estado del master como override
-  uint8_t mask = (1 << NUM_RELAYS) - 1;  // 0b00000111 para 3 relés
+  uint8_t mask = (1 << NUM_RELAYS) - 1; // 0b00000111 para 3 relés
 
-  if (!masterSections) {
+  if (!masterSections)
+  {
     // Master OFF → forzamos TODAS las secciones OFF (independientemente del modo)
-    onLo  = 0x00;
-    offLo = mask;          // bits en 1 = forzadas OFF
-    onHi  = 0x00;
-    offHi = 0xFF;          // si tuvieras más secciones
-  } else {
+    onLo = 0x00;
+    offLo = mask; // bits en 1 = forzadas OFF
+    onHi = 0x00;
+    offHi = 0xFF; // si tuvieras más secciones
+  }
+  else
+  {
     // Master ON → no hay override manual (AOG controla normalmente)
-    onLo  = 0x00;
+    onLo = 0x00;
     offLo = 0x00;
-    onHi  = 0x00;
+    onHi = 0x00;
     offHi = 0x00;
   }
 
   // Si estás en MANUAL y master ON → opcional: reportar todas ON
-  if (!autoMode && masterSections) {
-    onLo  = mask;
-    offLo = 0x00;
+  if (!autoMode && masterSections)
+  {
+    onLo = manualSections;
+    offLo = (~manualSections) & mask;
   }
 
-  msg[9]  = onLo;
+  msg[9] = onLo;
   msg[10] = offLo;
   msg[11] = onHi;
   msg[12] = offHi;
 
   byte ck = 0;
-  for (int i = 2; i < 13; i++) ck += msg[i];
+  for (int i = 2; i < 13; i++)
+    ck += msg[i];
   msg[13] = ck;
 
-  udp.beginPacket(broadcastIP, udpRemotePort);
+  IPAddress targetIP = aogIPKnown ? aogIP : broadcastIP;
+  udp.beginPacket(targetIP, udpRemotePort);
   udp.write(msg, 14);
   udp.endPacket();
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(100);
+void checkWifiReset()
+{
+  static bool lastState = HIGH;
+  bool currentState = digitalRead(PIN_RESET_WIFI);
 
-  for (int i = 0; i < NUM_RELAYS; i++) {
-    pinMode(relayPins[i], OUTPUT);
-    digitalWrite(relayPins[i], LOW);   // apagados al inicio
+  // Detecta presión (flanco)
+  if (currentState == LOW && lastState == HIGH)
+  {
+    resetPressTime = millis();
+    resetTriggered = false;
   }
 
-  pinMode(PIN_AUTO,   INPUT_PULLDOWN);
-  pinMode(PIN_MASTER, INPUT_PULLDOWN);
-  //Configuracion de AGO
-  WiFiManager wm; 
-  bool res;
-   res = wm.autoConnect("SectionAGO");
+  // Si sigue presionado
+  if (currentState == LOW && !resetTriggered)
+  {
+    if (millis() - resetPressTime > 2000)
+    {
+      Serial.println("Reset WiFiManager!");
 
-    if(!res) {
-        Serial.println("Failed to connect");
-        ESP.restart();
-    } 
-    else {
-        //if you get here you have connected to the WiFi    
-        Serial.println("connected...yeey :)");
+      WiFiManager wm;
+      wm.resetSettings();
+
+      delay(1000);
+      ESP.restart();
+      resetTriggered = true;
     }
- 
+  }
+
+  lastState = currentState;
+}
+
+uint8_t readSwitches()
+{
+  uint8_t value = 0;
+
+  for (int i = 0; i < NUM_SWITCHES; i++)
+  {
+    if (digitalRead(switchPins[i]) == LOW)
+    {
+      bitSet(value, i);
+    }
+  }
+
+  return value;
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  pinMode(PIN_RESET_WIFI, INPUT_PULLUP);
+  delay(100);
+
+  // gpsInit();
+
+  for (int i = 0; i < NUM_RELAYS; i++)
+  {
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], LOW); // apagados al inicio
+  }
+
+  for (int i = 0; i < NUM_SWITCHES; i++)
+  {
+    pinMode(switchPins[i], INPUT_PULLUP);
+  }
+
+  manualSections = readSwitches();
+
+  pinMode(PIN_AUTO, INPUT_PULLDOWN);
+  pinMode(PIN_MASTER, INPUT_PULLDOWN);
+  // Configuracion de AGO
+  WiFiManager wm;
+  bool res;
+  res = wm.autoConnect("SectionAGO");
+
+  if (!res)
+  {
+    Serial.println("Failed to connect");
+    ESP.restart();
+  }
+  else
+  {
+    // if you get here you have connected to the WiFi
+    Serial.println("connected...yeey :)");
+  }
 
   Serial.println("\nConectado! IP: " + WiFi.localIP().toString());
-  
+
   broadcastIP = WiFi.localIP();
   broadcastIP[3] = 255;
-  Serial.print("Broadcast: "); Serial.println(broadcastIP);
+  Serial.print("Broadcast: ");
+  Serial.println(broadcastIP);
 
   udp.begin(udpLocalPort);
   Serial.println("UDP escuchando en puerto 8888");
@@ -186,35 +296,52 @@ void setup() {
   sendHello();
 }
 
-void loop() {
+void loop()
+{
   checkButtons();
-
+  manualSections = readSwitches();
+  //  gpsUpdate();
   // Recibir paquetes UDP
   int packetSize = udp.parsePacket();
-  if (packetSize > 0 && packetSize < sizeof(buffer)) {
+  if (packetSize > 0 && packetSize < sizeof(buffer))
+  {
+    IPAddress remote = udp.remoteIP();
+
     int len = udp.read(buffer, sizeof(buffer));
-    if (len >= 5 && buffer[0] == 0x80 && buffer[1] == 0x81 && buffer[2] == 0x7F) {
-      
+    if (len >= 5 && buffer[0] == 0x80 && buffer[1] == 0x81 && buffer[2] == 0x7F)
+    {
+
       uint8_t pgn = buffer[3];
       // Serial.print("PGN: "); Serial.println(pgn);
+      if (!aogIPKnown)
+      {
+        aogIP = remote;
+        aogIPKnown = true;
 
-      if (pgn == 202) {           // scan request
+        Serial.print("AOG detectado en: ");
+        Serial.println(aogIP);
+      }
+      if (pgn == 202)
+      { // scan request
         sendScanReply();
       }
-      else if (pgn == 239) {      // machine data → comandos de secciones
-        if (autoMode){//en modo auto solo lee lo que viene 
-        // hydLift   = buffer[7];
-        // tramline  = buffer[8];
-        // geoStop   = buffer[9];
-        sectionLo = buffer[11];
+      else if (pgn == 239)
+      { // machine data → comandos de secciones
+        if (autoMode)
+        { // en modo auto solo lee lo que viene
+          // hydLift   = buffer[7];
+          // tramline  = buffer[8];
+          // geoStop   = buffer[9];
+          sectionLo = buffer[11];
 
-        sectionHi = buffer[12];
+          sectionHi = buffer[12];
 
-        watchdog = 0;             // reset watchdog
-      //Serial.print("Secciones recibidas Lo: "); Serial.println(sectionLo, BIN);
+          watchdog = 0; // reset watchdog
+                        // Serial.print("Secciones recibidas Lo: "); Serial.println(sectionLo, BIN);
         }
-    }
-      else if (pgn == 200) {      // hello from AgIO
+      }
+      else if (pgn == 200)
+      { // hello from AgIO
         sendHello();
       }
     }
@@ -222,25 +349,42 @@ void loop() {
 
   // Watchdog – si no llega nada en ~2 segundos → apagar todo
   watchdog++;
-  if (watchdog > 400) {
+  if (watchdog > 400)
+  {
     sectionLo = sectionHi = 0;
-    masterSections = false;   // o mantener último estado, según prefieras
+    masterSections = false; // o mantener último estado, según prefieras
+    aogIPKnown = false;
     Serial.println(watchdog);
   }
 
   // Enviar hello cada ~1 segundo
-  if (millis() - lastHello > 1000) {
+  if (millis() - lastHello > 1000)
+  {
     sendHello();
     lastHello = millis();
   }
 
+  if (gpsAvailable())
+  {
+    char *data = gpsBuildNmea();
+
+    Serial.print(data);
+    IPAddress targetIP = aogIPKnown ? aogIP : broadcastIP;
+    udp.beginPacket(targetIP, udpRemotePort);
+    udp.print(data);
+    udp.endPacket();
+
+    // Acá podés enviar por UDP, CAN, etc.
+  }
 
   // Enviar estado a AOG cada ~200 ms (como el código original)
-  if (millis() - lastSend > 200) {
+  if (millis() - lastSend > 200)
+  {
     sendToAOG();
     lastSend = millis();
   }
 
   // Aplicar relés
   updateRelays();
+  checkWifiReset();
 }
